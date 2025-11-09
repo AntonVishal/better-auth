@@ -1,4 +1,4 @@
-import * as z from "zod";
+import { z } from "zod";
 import { apple } from "./apple";
 import { atlassian } from "./atlassian";
 import { cognito } from "./cognito";
@@ -82,7 +82,7 @@ export type SocialProviders = {
 	[K in SocialProviderList[number]]?: Parameters<
 		(typeof socialProviders)[K]
 	>[0] & {
-		enabled?: boolean;
+		enabled?: boolean | undefined;
 	};
 };
 
