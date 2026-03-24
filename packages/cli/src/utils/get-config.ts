@@ -1,16 +1,17 @@
+import fs, { existsSync } from "node:fs";
+import path from "node:path";
 // @ts-expect-error
 import babelPresetReact from "@babel/preset-react";
 // @ts-expect-error
 import babelPresetTypeScript from "@babel/preset-typescript";
-import type { BetterAuthOptions } from "better-auth";
-import { BetterAuthError, logger } from "better-auth";
+import type { BetterAuthOptions } from "@better-auth/core";
+import { BetterAuthError } from "@better-auth/core/error";
 import { loadConfig } from "c12";
-import fs, { existsSync } from "fs";
+import type { TsConfigResult } from "get-tsconfig";
+import { getTsconfig, parseTsconfig } from "get-tsconfig";
 import type { JitiOptions } from "jiti";
-import path from "path";
 import { addCloudflareModules } from "./add-cloudflare-modules";
 import { addSvelteKitEnvModules } from "./add-svelte-kit-env-modules";
-import { getTsconfigInfo } from "./get-tsconfig-info";
 
 let possiblePaths = [
 	"auth.ts",
@@ -19,12 +20,20 @@ let possiblePaths = [
 	"auth.jsx",
 	"auth.server.js",
 	"auth.server.ts",
+	"auth/index.ts",
+	"auth/index.tsx",
+	"auth/index.js",
+	"auth/index.jsx",
+	"auth/index.server.js",
+	"auth/index.server.ts",
 ];
 
 possiblePaths = [
 	...possiblePaths,
 	...possiblePaths.map((it) => `lib/server/${it}`),
+	...possiblePaths.map((it) => `server/auth/${it}`),
 	...possiblePaths.map((it) => `server/${it}`),
+	...possiblePaths.map((it) => `auth/${it}`),
 	...possiblePaths.map((it) => `lib/${it}`),
 	...possiblePaths.map((it) => `utils/${it}`),
 ];
@@ -34,90 +43,104 @@ possiblePaths = [
 	...possiblePaths.map((it) => `app/${it}`),
 ];
 
-function resolveReferencePath(configDir: string, refPath: string): string {
-	const resolvedPath = path.resolve(configDir, refPath);
-
-	// If it ends with .json, treat as direct file reference
-	if (refPath.endsWith(".json")) {
-		return resolvedPath;
-	}
-
-	// If the exact path exists and is a file, use it
-	if (fs.existsSync(resolvedPath)) {
-		try {
-			const stats = fs.statSync(resolvedPath);
-			if (stats.isFile()) {
-				return resolvedPath;
-			}
-		} catch {
-			// Fall through to directory handling
+function mergeAliases(
+	target: Record<string, string>,
+	source: Record<string, string>,
+): void {
+	for (const [alias, aliasPath] of Object.entries(source)) {
+		if (!(alias in target)) {
+			target[alias] = aliasPath;
 		}
 	}
-
-	// Otherwise, assume directory reference
-	return path.resolve(configDir, refPath, "tsconfig.json");
 }
 
-function getPathAliasesRecursive(
+function extractAliases(tsconfig: TsConfigResult): Record<string, string> {
+	const { paths = {}, baseUrl } = tsconfig.config.compilerOptions ?? {};
+	const result: Record<string, string> = {};
+	const configDir = path.dirname(tsconfig.path);
+	const resolvedBaseUrl = baseUrl
+		? path.resolve(configDir, baseUrl)
+		: configDir;
+
+	for (const [alias, aliasPaths = []] of Object.entries(paths)) {
+		for (const aliasedPath of aliasPaths) {
+			const finalAlias = alias.slice(-1) === "*" ? alias.slice(0, -1) : alias;
+			const finalAliasedPath =
+				aliasedPath.slice(-1) === "*" ? aliasedPath.slice(0, -1) : aliasedPath;
+
+			result[finalAlias || ""] = path.join(resolvedBaseUrl, finalAliasedPath);
+		}
+	}
+	return result;
+}
+
+/**
+ * Reads raw tsconfig JSON to get `references` (which get-tsconfig strips out).
+ */
+function readRawTsconfigReferences(
+	tsconfigPath: string,
+): Array<{ path: string }> | undefined {
+	try {
+		const text = fs.readFileSync(tsconfigPath, "utf-8");
+		const stripped = text
+			.replace(/\\"|"(?:\\"|[^"])*"|(\/\/.*|\/\*[\s\S]*?\*\/)/g, (m, g) =>
+				g ? "" : m,
+			)
+			.replace(/,(?=\s*[}\]])/g, "");
+		const raw = JSON.parse(stripped);
+		return raw.references;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Collect path aliases from tsconfig references recursively.
+ */
+function collectReferencesAliases(
 	tsconfigPath: string,
 	visited = new Set<string>(),
 ): Record<string, string> {
-	if (visited.has(tsconfigPath)) {
-		return {};
-	}
-	visited.add(tsconfigPath);
+	const result: Record<string, string> = {};
+	const refs = readRawTsconfigReferences(tsconfigPath);
+	if (!refs) return result;
 
-	if (!fs.existsSync(tsconfigPath)) {
-		logger.warn(`Referenced tsconfig not found: ${tsconfigPath}`);
-		return {};
-	}
+	const configDir = path.dirname(tsconfigPath);
+	for (const ref of refs) {
+		const resolvedRef = path.resolve(configDir, ref.path);
+		const refTsconfigPath = resolvedRef.endsWith(".json")
+			? resolvedRef
+			: path.join(resolvedRef, "tsconfig.json");
 
-	try {
-		const tsConfig = getTsconfigInfo(undefined, tsconfigPath);
-		const { paths = {}, baseUrl = "." } = tsConfig.compilerOptions || {};
-		const result: Record<string, string> = {};
+		if (visited.has(refTsconfigPath)) continue;
+		visited.add(refTsconfigPath);
 
-		const configDir = path.dirname(tsconfigPath);
-		const obj = Object.entries(paths) as [string, string[]][];
-		for (const [alias, aliasPaths] of obj) {
-			for (const aliasedPath of aliasPaths) {
-				const resolvedBaseUrl = path.resolve(configDir, baseUrl);
-				const finalAlias = alias.slice(-1) === "*" ? alias.slice(0, -1) : alias;
-				const finalAliasedPath =
-					aliasedPath.slice(-1) === "*"
-						? aliasedPath.slice(0, -1)
-						: aliasedPath;
-
-				result[finalAlias || ""] = path.join(resolvedBaseUrl, finalAliasedPath);
-			}
+		try {
+			const refConfig = parseTsconfig(refTsconfigPath);
+			mergeAliases(
+				result,
+				extractAliases({ path: refTsconfigPath, config: refConfig }),
+			);
+		} catch {
+			continue;
 		}
 
-		if (tsConfig.references) {
-			for (const ref of tsConfig.references) {
-				const refPath = resolveReferencePath(configDir, ref.path);
-				const refAliases = getPathAliasesRecursive(refPath, visited);
-				for (const [alias, aliasPath] of Object.entries(refAliases)) {
-					if (!(alias in result)) {
-						result[alias] = aliasPath;
-					}
-				}
-			}
-		}
-
-		return result;
-	} catch (error) {
-		logger.warn(`Error parsing tsconfig at ${tsconfigPath}: ${error}`);
-		return {};
+		mergeAliases(result, collectReferencesAliases(refTsconfigPath, visited));
 	}
+	return result;
 }
 
 function getPathAliases(cwd: string): Record<string, string> | null {
-	const tsConfigPath = path.join(cwd, "tsconfig.json");
-	if (!fs.existsSync(tsConfigPath)) {
+	const configName = fs.existsSync(path.join(cwd, "tsconfig.json"))
+		? "tsconfig.json"
+		: "jsconfig.json";
+	const tsconfig = getTsconfig(cwd, configName);
+	if (!tsconfig) {
 		return null;
 	}
 	try {
-		const result = getPathAliasesRecursive(tsConfigPath);
+		const result = extractAliases(tsconfig);
+		mergeAliases(result, collectReferencesAliases(tsconfig.path));
 		addSvelteKitEnvModules(result);
 		addCloudflareModules(result);
 		return result;
@@ -187,8 +210,11 @@ export async function getConfig({
 				  }
 			>({
 				configFile: resolvedPath,
-				dotenv: true,
+				dotenv: {
+					fileName: [".env", ".env.local"],
+				},
 				jitiOptions: jitiOptions(cwd),
+				cwd,
 			});
 			if (!("auth" in config) && !isDefaultExport(config)) {
 				if (shouldThrowOnError) {
@@ -196,7 +222,7 @@ export async function getConfig({
 						`Couldn't read your auth config in ${resolvedPath}. Make sure to default export your auth instance or to export as a variable named auth.`,
 					);
 				}
-				logger.error(
+				console.error(
 					`[#better-auth]: Couldn't read your auth config in ${resolvedPath}. Make sure to default export your auth instance or to export as a variable named auth.`,
 				);
 				process.exit(1);
@@ -216,7 +242,11 @@ export async function getConfig({
 						};
 					}>({
 						configFile: possiblePath,
+						dotenv: {
+							fileName: [".env", ".env.local"],
+						},
 						jitiOptions: jitiOptions(cwd),
+						cwd,
 					});
 					const hasConfig = Object.keys(config).length > 0;
 					if (hasConfig) {
@@ -228,9 +258,9 @@ export async function getConfig({
 									"Couldn't read your auth config. Make sure to default export your auth instance or to export as a variable named auth.",
 								);
 							}
-							logger.error("[#better-auth]: Couldn't read your auth config.");
+							console.error("[#better-auth]: Couldn't read your auth config.");
 							console.log("");
-							logger.info(
+							console.log(
 								"[#better-auth]: Make sure to default export your auth instance or to export as a variable named auth.",
 							);
 							process.exit(1);
@@ -252,7 +282,7 @@ export async function getConfig({
 								`Please remove import 'server-only' from your auth config file temporarily. The CLI cannot resolve the configuration with it included. You can re-add it after running the CLI.`,
 							);
 						}
-						logger.error(
+						console.error(
 							`Please remove import 'server-only' from your auth config file temporarily. The CLI cannot resolve the configuration with it included. You can re-add it after running the CLI.`,
 						);
 						process.exit(1);
@@ -260,7 +290,7 @@ export async function getConfig({
 					if (shouldThrowOnError) {
 						throw e;
 					}
-					logger.error("[#better-auth]: Couldn't read your auth config.", e);
+					console.error("[#better-auth]: Couldn't read your auth config.", e);
 					process.exit(1);
 				}
 			}
@@ -281,7 +311,7 @@ export async function getConfig({
 					`Please remove import 'server-only' from your auth config file temporarily. The CLI cannot resolve the configuration with it included. You can re-add it after running the CLI.`,
 				);
 			}
-			logger.error(
+			console.error(
 				`Please remove import 'server-only' from your auth config file temporarily. The CLI cannot resolve the configuration with it included. You can re-add it after running the CLI.`,
 			);
 			process.exit(1);
@@ -290,9 +320,7 @@ export async function getConfig({
 			throw e;
 		}
 
-		logger.error("Couldn't read your auth config.", e);
+		console.error("Couldn't read your auth config.", e);
 		process.exit(1);
 	}
 }
-
-export { possiblePaths };

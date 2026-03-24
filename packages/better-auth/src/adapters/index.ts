@@ -5,7 +5,7 @@ import type {
 	AdapterFactoryOptions,
 	AdapterTestDebugLogs,
 	CustomAdapter,
-} from "./adapter-factory";
+} from "@better-auth/core/db/adapter";
 import {
 	createAdapterFactory,
 	initGetDefaultFieldName,
@@ -14,7 +14,7 @@ import {
 	initGetFieldName,
 	initGetIdField,
 	initGetModelName,
-} from "./adapter-factory";
+} from "@better-auth/core/db/adapter";
 
 export * from "@better-auth/core/db/adapter";
 
@@ -37,21 +37,21 @@ export {
 };
 
 /**
- * @deprecated Use `createAdapterFactory` instead. This export will be removed in the next major version.
+ * @deprecated Use `createAdapterFactory` instead.
  */
 export const createAdapter = createAdapterFactory;
 
 /**
- * @deprecated Use `AdapterFactoryOptions` instead. This export will be removed in the next major version.
+ * @deprecated Use `AdapterFactoryOptions` instead.
  */
 export type CreateAdapterOptions = AdapterFactoryOptions;
 
 /**
- * @deprecated Use `AdapterFactoryConfig` instead. This export will be removed in the next major version.
+ * @deprecated Use `AdapterFactoryConfig` instead.
  */
 export type AdapterConfig = AdapterFactoryConfig;
 
 /**
- * @deprecated Use `AdapterFactoryCustomizeAdapterCreator` instead. This export will be removed in the next major version.
+ * @deprecated Use `AdapterFactoryCustomizeAdapterCreator` instead.
  */
 export type CreateCustomAdapter = AdapterFactoryCustomizeAdapterCreator;
