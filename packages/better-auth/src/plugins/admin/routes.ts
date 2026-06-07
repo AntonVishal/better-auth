@@ -153,6 +153,14 @@ export const setRole = <O extends AdminOptions>(opts: O) =>
 					}
 				}
 			}
+
+			const isUserExist = await ctx.context.internalAdapter.findUserById(
+				ctx.body.userId,
+			);
+			if (!isUserExist) {
+				throw APIError.from("NOT_FOUND", BASE_ERROR_CODES.USER_NOT_FOUND);
+			}
+
 			const updatedUser = await ctx.context.internalAdapter.updateUser(
 				ctx.body.userId,
 				{
@@ -507,6 +515,14 @@ export const adminUpdateUser = (opts: AdminOptions) =>
 					inputRoles as string[],
 				);
 			}
+
+			const isUserExist = await ctx.context.internalAdapter.findUserById(
+				ctx.body.userId,
+			);
+			if (!isUserExist) {
+				throw APIError.from("NOT_FOUND", BASE_ERROR_CODES.USER_NOT_FOUND);
+			}
+
 			const updatedUser = await ctx.context.internalAdapter.updateUser(
 				ctx.body.userId,
 				ctx.body.data,
@@ -851,6 +867,13 @@ export const unbanUser = (opts: AdminOptions) =>
 				);
 			}
 
+			const isUserExist = await ctx.context.internalAdapter.findUserById(
+				ctx.body.userId,
+			);
+			if (!isUserExist) {
+				throw APIError.from("NOT_FOUND", BASE_ERROR_CODES.USER_NOT_FOUND);
+			}
+
 			const user = await ctx.context.internalAdapter.updateUser(
 				ctx.body.userId,
 				{
@@ -983,7 +1006,7 @@ export const banUser = (opts: AdminOptions) =>
 				},
 			);
 			//revoke all sessions
-			await ctx.context.internalAdapter.deleteSessions(ctx.body.userId);
+			await ctx.context.internalAdapter.deleteUserSessions(ctx.body.userId);
 			return ctx.json({
 				user: parseUserOutput(ctx.context.options, user) as UserWithRole,
 			});
@@ -1367,7 +1390,7 @@ export const revokeUserSessions = (opts: AdminOptions) =>
 				);
 			}
 
-			await ctx.context.internalAdapter.deleteSessions(ctx.body.userId);
+			await ctx.context.internalAdapter.deleteUserSessions(ctx.body.userId);
 			return ctx.json({
 				success: true,
 			});
@@ -1460,6 +1483,7 @@ export const removeUser = (opts: AdminOptions) =>
 				throw APIError.from("NOT_FOUND", BASE_ERROR_CODES.USER_NOT_FOUND);
 			}
 
+			await ctx.context.internalAdapter.deleteUserSessions(ctx.body.userId);
 			await ctx.context.internalAdapter.deleteUser(ctx.body.userId);
 			return ctx.json({
 				success: true,
@@ -1568,13 +1592,11 @@ const userHasPermissionBodySchema = z
 		}),
 	})
 	.and(
-		z.union([
+		z.xor([
 			z.object({
 				permission: z.record(z.string(), z.array(z.string())),
-				permissions: z.undefined(),
 			}),
 			z.object({
-				permission: z.undefined(),
 				permissions: z.record(z.string(), z.array(z.string())),
 			}),
 		]),

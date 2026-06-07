@@ -3,6 +3,8 @@ import type {
 	BetterAuthClientPlugin,
 	ClientFetchOption,
 } from "@better-auth/core";
+import { isSafeUrlScheme } from "@better-auth/core/utils/url";
+import { PACKAGE_VERSION } from "../../version";
 
 declare global {
 	interface Window {
@@ -192,6 +194,7 @@ const noRetryReasons = {
 export const oneTapClient = (options: GoogleOneTapOptions) => {
 	return {
 		id: "one-tap",
+		version: PACKAGE_VERSION,
 		fetchPlugins: [
 			{
 				id: "fedcm-signout-handle",
@@ -255,7 +258,10 @@ export const oneTapClient = (options: GoogleOneTapOptions) => {
 							});
 
 							if ((!opts?.fetchOptions && !fetchOptions) || opts?.callbackURL) {
-								window.location.href = opts?.callbackURL ?? "/";
+								const target = opts?.callbackURL ?? "/";
+								if (isSafeUrlScheme(target)) {
+									window.location.href = target;
+								}
 							}
 						}
 
@@ -301,7 +307,10 @@ export const oneTapClient = (options: GoogleOneTapOptions) => {
 						});
 
 						if ((!opts?.fetchOptions && !fetchOptions) || opts?.callbackURL) {
-							window.location.href = opts?.callbackURL ?? "/";
+							const target = opts?.callbackURL ?? "/";
+							if (isSafeUrlScheme(target)) {
+								window.location.href = target;
+							}
 						}
 					}
 

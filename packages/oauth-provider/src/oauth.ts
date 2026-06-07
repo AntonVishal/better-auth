@@ -1,3 +1,4 @@
+import type { GenericEndpointContext } from "@better-auth/core";
 import { defineRequestState } from "@better-auth/core/context";
 import { logger } from "@better-auth/core/env";
 import { BetterAuthError } from "@better-auth/core/error";
@@ -17,7 +18,11 @@ import { consentEndpoint } from "./consent";
 import { continueEndpoint } from "./continue";
 import { introspectEndpoint } from "./introspect";
 import { rpInitiatedLogoutEndpoint } from "./logout";
-import { authServerMetadata, oidcServerMetadata } from "./metadata";
+import {
+	authServerMetadata,
+	metadataResponse,
+	oidcServerMetadata,
+} from "./metadata";
 import * as oauthClientEndpoints from "./oauthClient";
 import * as oauthConsentEndpoints from "./oauthConsent";
 import { registerEndpoint } from "./register";
@@ -28,10 +33,15 @@ import type { OAuthOptions, Scope } from "./types";
 import { SafeUrlSchema } from "./types/zod";
 import { userInfoEndpoint } from "./userinfo";
 import {
-	deleteFromPrompt,
 	getJwtPlugin,
+	getSignedQueryIssuedAt,
+	postLoginClearedParam,
+	removePromptFromQuery,
+	searchParamsToQuery,
+	signedQueryIssuedAtParam,
 	verifyOAuthQueryParams,
 } from "./utils";
+import { PACKAGE_VERSION } from "./version";
 
 declare module "@better-auth/core" {
 	interface BetterAuthPluginRegistry<AuthOptions, Options> {
@@ -41,9 +51,11 @@ declare module "@better-auth/core" {
 	}
 }
 
-export const oAuthState = defineRequestState<{ query?: string } | null>(
-	() => null,
-);
+export const oAuthState = defineRequestState<{
+	query?: string;
+	signedQueryIssuedAt?: Date;
+	postLoginClearedForSession?: string;
+} | null>(() => null);
 export const getOAuthProviderState = oAuthState.get;
 
 /**
@@ -162,12 +174,100 @@ export const oauthProvider = <O extends OAuthOptions<Scope[]>>(options: O) => {
 		);
 	}
 
+	const handleIssuerMetadataRequest: NonNullable<
+		BetterAuthPlugin["onRequest"]
+	> = async (request, ctx) => {
+		const requestPathname = new URL(request.url).pathname;
+		const requestPath = ctx.options.advanced?.skipTrailingSlashes
+			? requestPathname.replace(/\/+$/, "") || "/"
+			: requestPathname;
+		const issuer = opts.disableJwtPlugin
+			? ctx.baseURL
+			: (getJwtPlugin(ctx)?.options?.jwt?.issuer ?? ctx.baseURL);
+		let issuerPath = "/";
+		try {
+			issuerPath = new URL(issuer).pathname.replace(/\/$/, "") || "";
+		} catch {
+			issuerPath = new URL(ctx.baseURL).pathname.replace(/\/$/, "") || "";
+		}
+
+		const endpointCtx = { context: ctx } as GenericEndpointContext;
+		// RFC 8414 uses path insertion; some clients derive discovery from the
+		// issuer URL directly, so keep both public aliases equivalent.
+		const authServerMetadataPaths = new Set([
+			`/.well-known/oauth-authorization-server${issuerPath}`,
+			`${issuerPath}/.well-known/oauth-authorization-server`,
+		]);
+		const openIdConfigPath = `${issuerPath}/.well-known/openid-configuration`;
+		const isAuthServerMetadataRequest =
+			authServerMetadataPaths.has(requestPath);
+		const isOpenIdConfigRequest =
+			opts.scopes?.includes("openid") && requestPath === openIdConfigPath;
+		const createMetadataResponse = (metadata: unknown) => {
+			const response = metadataResponse(metadata);
+			if (request.method === "HEAD") {
+				return new Response(null, {
+					status: response.status,
+					headers: response.headers,
+				});
+			}
+			return response;
+		};
+		if (isAuthServerMetadataRequest || isOpenIdConfigRequest) {
+			if (request.method !== "GET" && request.method !== "HEAD") {
+				return {
+					response: new Response(null, {
+						status: 405,
+						headers: {
+							Allow: "GET, HEAD",
+						},
+					}),
+				};
+			}
+		}
+
+		if (isAuthServerMetadataRequest) {
+			if (opts.scopes?.includes("openid")) {
+				return {
+					response: createMetadataResponse(
+						oidcServerMetadata(endpointCtx, opts),
+					),
+				};
+			}
+			const jwtPluginOptions = opts.disableJwtPlugin
+				? undefined
+				: getJwtPlugin(ctx)?.options;
+			const metadata = authServerMetadata(endpointCtx, jwtPluginOptions, {
+				scopes_supported:
+					opts.advertisedMetadata?.scopes_supported ?? opts.scopes,
+				dynamic_client_registration_supported:
+					opts.allowDynamicClientRegistration,
+				public_client_supported: opts.allowUnauthenticatedClientRegistration,
+				grant_types_supported: opts.grantTypes,
+				jwt_disabled: opts.disableJwtPlugin,
+			});
+			return {
+				response: createMetadataResponse(metadata),
+			};
+		}
+
+		if (isOpenIdConfigRequest) {
+			return {
+				response: createMetadataResponse(oidcServerMetadata(endpointCtx, opts)),
+			};
+		}
+	};
 	return {
 		id: "oauth-provider",
+		version: PACKAGE_VERSION,
 		options: opts as NoInfer<O>,
 		init: (ctx) => {
-			// Require session id storage on database (secondary-storage only solution not yet supported)
-			if (ctx.options.session && !ctx.options.session.storeSessionInDatabase) {
+			// OAuth provider performs adapter-level session lookups by id, so it
+			// currently requires DB-backed sessions whenever secondary storage is enabled.
+			if (
+				ctx.options.secondaryStorage &&
+				ctx.options.session?.storeSessionInDatabase !== true
+			) {
 				throw new BetterAuthError(
 					"OAuth Provider requires `session.storeSessionInDatabase: true` when using secondaryStorage",
 				);
@@ -180,7 +280,21 @@ export const oauthProvider = <O extends OAuthOptions<Scope[]>>(options: O) => {
 
 				// Issuer and well-known endpoint checks
 				const issuer = jwtPluginOptions?.jwt?.issuer ?? ctx.baseURL;
-				const issuerPath = new URL(issuer).pathname;
+				const isDynamicBaseURLInit =
+					jwtPluginOptions?.jwt?.issuer == null &&
+					typeof ctx.options.baseURL === "object" &&
+					ctx.options.baseURL !== null &&
+					"allowedHosts" in ctx.options.baseURL;
+				let issuerPath: string;
+				try {
+					issuerPath = new URL(issuer).pathname;
+				} catch (error) {
+					// baseURL may not be available during init when using dynamic baseURL config
+					if (isDynamicBaseURLInit && issuer === "") {
+						return;
+					}
+					throw error;
+				}
 				// oAuth Server Config
 				if (
 					!opts.silenceWarnings?.oauthAuthServerConfig &&
@@ -202,6 +316,7 @@ export const oauthProvider = <O extends OAuthOptions<Scope[]>>(options: O) => {
 				}
 			}
 		},
+		onRequest: handleIssuerMetadataRequest,
 		hooks: {
 			before: [
 				{
@@ -221,11 +336,18 @@ export const oauthProvider = <O extends OAuthOptions<Scope[]>>(options: O) => {
 								error: "invalid_signature",
 							});
 						}
+						const signedQueryIssuedAt = getSignedQueryIssuedAt(query);
 						const queryParams = new URLSearchParams(query);
+						const postLoginClearedForSession =
+							queryParams.get(postLoginClearedParam) ?? undefined;
 						queryParams.delete("sig");
 						queryParams.delete("exp");
+						queryParams.delete(signedQueryIssuedAtParam);
+						queryParams.delete(postLoginClearedParam);
 						await oAuthState.set({
 							query: queryParams.toString(),
+							signedQueryIssuedAt: signedQueryIssuedAt ?? undefined,
+							postLoginClearedForSession,
 						});
 
 						// If path starts oauth2 authorize (ie /sign-in/social, /sign-in/oauth2), add to additional data body
@@ -269,7 +391,22 @@ export const oauthProvider = <O extends OAuthOptions<Scope[]>>(options: O) => {
 						if (!session) return;
 						ctx.context.session = session;
 
-						ctx.query = deleteFromPrompt(query, "login");
+						const secFetchMode = ctx.request?.headers
+							?.get("sec-fetch-mode")
+							?.toLowerCase();
+						const acceptHeader =
+							ctx.request?.headers?.get("accept")?.toLowerCase() ?? "";
+						const isNavigationRequest =
+							secFetchMode === "navigate" ||
+							(!secFetchMode &&
+								(acceptHeader.includes("text/html") ||
+									acceptHeader.includes("application/xhtml+xml")));
+						if (!isNavigationRequest) {
+							ctx.headers?.set("accept", "application/json");
+						}
+						ctx.query = searchParamsToQuery(
+							removePromptFromQuery(query, "login"),
+						);
 						return await authorizeEndpoint(ctx, opts);
 					}),
 				},
@@ -302,6 +439,8 @@ export const oauthProvider = <O extends OAuthOptions<Scope[]>>(options: O) => {
 						const authMetadata = authServerMetadata(ctx, jwtPluginOptions, {
 							scopes_supported:
 								opts.advertisedMetadata?.scopes_supported ?? opts.scopes,
+							dynamic_client_registration_supported:
+								opts.allowDynamicClientRegistration,
 							public_client_supported:
 								opts.allowUnauthenticatedClientRegistration,
 							grant_types_supported: opts.grantTypes,
@@ -339,11 +478,12 @@ export const oauthProvider = <O extends OAuthOptions<Scope[]>>(options: O) => {
 				{
 					method: "GET",
 					query: z.object({
-						response_type: z.enum(["code"]),
+						response_type: z.enum(["code"]).optional(),
 						client_id: z.string(),
 						redirect_uri: SafeUrlSchema.optional(),
 						scope: z.string().optional(),
 						state: z.string().optional(),
+						request_uri: z.string().optional(),
 						code_challenge: z.string().optional(),
 						code_challenge_method: z.enum(["S256"]).optional(),
 						nonce: z.string().optional(),
@@ -366,7 +506,7 @@ export const oauthProvider = <O extends OAuthOptions<Scope[]>>(options: O) => {
 								{
 									name: "response_type",
 									in: "query",
-									required: true,
+									required: false,
 									schema: { type: "string" },
 									description: "OAuth2 response type (e.g., 'code')",
 								},
@@ -397,6 +537,14 @@ export const oauthProvider = <O extends OAuthOptions<Scope[]>>(options: O) => {
 									required: false,
 									schema: { type: "string" },
 									description: "OAuth2 state parameter",
+								},
+								{
+									name: "request_uri",
+									in: "query",
+									required: false,
+									schema: { type: "string" },
+									description:
+										"Pushed Authorization Request URI referencing stored parameters",
 								},
 								{
 									name: "code_challenge",
@@ -1135,6 +1283,12 @@ export const oauthProvider = <O extends OAuthOptions<Scope[]>>(options: O) => {
 							.optional(),
 						type: z.enum(["web", "native", "user-agent-based"]).optional(),
 						subject_type: z.enum(["public", "pairwise"]).optional(),
+						skip_consent: z
+							.never({
+								error:
+									"skip_consent cannot be set during dynamic client registration",
+							})
+							.optional(),
 					}),
 					metadata: {
 						openapi: {

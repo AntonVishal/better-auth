@@ -6,6 +6,7 @@ import type { MockInstance } from "vitest";
 import {
 	afterAll,
 	afterEach,
+	assert,
 	beforeAll,
 	describe,
 	expect,
@@ -223,6 +224,331 @@ describe("account", async () => {
 				}),
 				data: expect.any(Object),
 			});
+		});
+	});
+
+	/**
+	 * @see https://github.com/better-auth/better-auth/issues/8350
+	 */
+	it("should get account info server-side using userId without session headers", async () => {
+		const { auth, client, cookieSetter } = await getTestInstance({
+			socialProviders: {
+				google: { clientId: "test", clientSecret: "test", enabled: true },
+			},
+		});
+
+		const headers = new Headers();
+		email = "account-info-server-side@test.com";
+		const signInRes = await client.signIn.social({
+			provider: "google",
+			callbackURL: "/callback",
+			fetchOptions: { onSuccess: cookieSetter(headers) },
+		});
+		const state =
+			signInRes.data && "url" in signInRes.data && signInRes.data.url
+				? new URL(signInRes.data.url).searchParams.get("state") || ""
+				: "";
+		await client.$fetch("/callback/google", {
+			query: { state, code: "test" },
+			headers,
+			method: "GET",
+			onError(context) {
+				cookieSetter(headers)({ response: context.response });
+			},
+		});
+
+		const accounts = await auth.api.listUserAccounts({ headers });
+		const googleAccount = accounts.find((a) => a.providerId === "google");
+		expect(googleAccount).toBeTruthy();
+
+		// No headers: the server-side caller identifies the user via userId.
+		const info = await auth.api.accountInfo({
+			query: {
+				accountId: googleAccount!.accountId,
+				userId: googleAccount!.userId,
+			},
+		});
+
+		expect(info).toMatchObject({
+			user: expect.objectContaining({
+				id: expect.any(String),
+				email: expect.any(String),
+			}),
+			data: expect.any(Object),
+		});
+	});
+
+	it("should reject account info over HTTP without a session even when userId is passed", async () => {
+		const { user } = await signInWithTestUser();
+		// Top-level $fetch carries no session; a passed userId must not bypass auth.
+		const info = await client.$fetch("/account-info", {
+			query: { accountId: "any-account-id", userId: user.id },
+			method: "GET",
+		});
+		expect(info.data).toBeNull();
+		expect(info.error?.status).toBe(401);
+	});
+
+	/**
+	 * @see https://github.com/better-auth/better-auth/issues/9502
+	 */
+	it("should resolve account info from the current user's accounts when provider account IDs collide", async () => {
+		const { auth, signInWithTestUser, client } = await getTestInstance({
+			socialProviders: {
+				google: {
+					clientId: "test",
+					clientSecret: "test",
+					enabled: true,
+				},
+			},
+			account: {
+				accountLinking: {
+					allowDifferentEmails: true,
+				},
+				encryptOAuthTokens: true,
+			},
+		});
+		const ctx = await auth.$context;
+		const googleProvider = ctx.socialProviders.find((v) => v.id === "google")!;
+		const getUserInfoMock = vi.spyOn(googleProvider, "getUserInfo");
+		const sharedAccountId = "shared-provider-account-id";
+		const otherUser = await ctx.internalAdapter.createUser({
+			name: "Other User",
+			email: "other-account-info@example.com",
+		});
+		await ctx.internalAdapter.createAccount({
+			userId: otherUser.id,
+			providerId: "google",
+			accountId: sharedAccountId,
+			accessToken: "other-access-token",
+		});
+
+		const { runWithUser, user } = await signInWithTestUser();
+		await ctx.internalAdapter.createAccount({
+			userId: user.id,
+			providerId: "google",
+			accountId: sharedAccountId,
+			accessToken: "current-access-token",
+		});
+
+		getUserInfoMock.mockResolvedValueOnce({
+			user: {
+				id: user.id,
+				name: user.name,
+				email: user.email,
+				emailVerified: user.emailVerified,
+			},
+			data: { source: "current-user" },
+		});
+
+		await runWithUser(async () => {
+			const info = await client.$fetch("/account-info", {
+				query: { accountId: sharedAccountId },
+				method: "GET",
+			});
+
+			expect(info.error).toBeNull();
+			expect(info.data).toMatchObject({
+				data: { source: "current-user" },
+			});
+			expect(getUserInfoMock).toHaveBeenCalledWith(
+				expect.objectContaining({ accessToken: "current-access-token" }),
+			);
+		});
+	});
+
+	it("should require providerId when a current user's provider account IDs collide", async () => {
+		const { auth, signInWithTestUser, client } = await getTestInstance({
+			socialProviders: {
+				google: {
+					clientId: "test",
+					clientSecret: "test",
+					enabled: true,
+				},
+				github: {
+					clientId: "test",
+					clientSecret: "test",
+					enabled: true,
+				},
+			},
+			account: {
+				accountLinking: {
+					allowDifferentEmails: true,
+				},
+			},
+		});
+		const ctx = await auth.$context;
+		const googleProvider = ctx.socialProviders.find((v) => v.id === "google")!;
+		const githubProvider = ctx.socialProviders.find((v) => v.id === "github")!;
+		const googleGetUserInfoMock = vi.spyOn(googleProvider, "getUserInfo");
+		const githubGetUserInfoMock = vi.spyOn(githubProvider, "getUserInfo");
+		const sharedAccountId = "shared-provider-account-id";
+
+		const { runWithUser, user } = await signInWithTestUser();
+		await ctx.internalAdapter.createAccount({
+			userId: user.id,
+			providerId: "google",
+			accountId: sharedAccountId,
+			accessToken: "google-access-token",
+		});
+		await ctx.internalAdapter.createAccount({
+			userId: user.id,
+			providerId: "github",
+			accountId: sharedAccountId,
+			accessToken: "github-access-token",
+		});
+
+		await runWithUser(async () => {
+			const ambiguousInfo = await client.$fetch("/account-info", {
+				query: { accountId: sharedAccountId },
+				method: "GET",
+			});
+
+			expect(ambiguousInfo.error?.message).toBe(
+				"Multiple accounts share this account ID. Pass a providerId to disambiguate.",
+			);
+			expect(googleGetUserInfoMock).not.toHaveBeenCalled();
+			expect(githubGetUserInfoMock).not.toHaveBeenCalled();
+
+			githubGetUserInfoMock.mockResolvedValueOnce({
+				user: {
+					id: user.id,
+					name: user.name,
+					email: user.email,
+					emailVerified: user.emailVerified,
+				},
+				data: { source: "github" },
+			});
+			const githubInfo = await client.$fetch("/account-info", {
+				query: { accountId: sharedAccountId, providerId: "github" },
+				method: "GET",
+			});
+
+			expect(githubInfo.error).toBeNull();
+			expect(githubInfo.data).toMatchObject({
+				data: { source: "github" },
+			});
+			expect(githubGetUserInfoMock).toHaveBeenCalledWith(
+				expect.objectContaining({ accessToken: "github-access-token" }),
+			);
+		});
+	});
+
+	/**
+	 * @see https://github.com/better-auth/better-auth/issues/9502
+	 */
+	it("should disambiguate by providerId on the server-side userId path without a session", async () => {
+		const { auth } = await getTestInstance({
+			socialProviders: {
+				google: { clientId: "test", clientSecret: "test", enabled: true },
+				github: { clientId: "test", clientSecret: "test", enabled: true },
+			},
+			account: {
+				accountLinking: {
+					allowDifferentEmails: true,
+				},
+			},
+		});
+		const ctx = await auth.$context;
+		const githubProvider = ctx.socialProviders.find((v) => v.id === "github")!;
+		const githubGetUserInfoMock = vi.spyOn(githubProvider, "getUserInfo");
+		const sharedAccountId = "shared-server-side-account-id";
+
+		const user = await ctx.internalAdapter.createUser({
+			name: "Server Side User",
+			email: "server-side-disambiguate@example.com",
+		});
+		await ctx.internalAdapter.createAccount({
+			userId: user.id,
+			providerId: "google",
+			accountId: sharedAccountId,
+			accessToken: "google-access-token",
+		});
+		await ctx.internalAdapter.createAccount({
+			userId: user.id,
+			providerId: "github",
+			accountId: sharedAccountId,
+			accessToken: "github-access-token",
+		});
+
+		githubGetUserInfoMock.mockResolvedValueOnce({
+			user: {
+				id: user.id,
+				name: user.name,
+				email: user.email,
+				emailVerified: user.emailVerified,
+			},
+			data: { source: "github" },
+		});
+
+		// No headers: the trusted server-side caller names the user via userId,
+		// and providerId disambiguates the colliding accountId.
+		const info = await auth.api.accountInfo({
+			query: {
+				accountId: sharedAccountId,
+				userId: user.id,
+				providerId: "github",
+			},
+		});
+
+		expect(info).toMatchObject({ data: { source: "github" } });
+		expect(githubGetUserInfoMock).toHaveBeenCalledWith(
+			expect.objectContaining({ accessToken: "github-access-token" }),
+		);
+	});
+
+	/**
+	 * @see https://github.com/better-auth/better-auth/issues/9502
+	 */
+	it("should not find an account when providerId matches none of the user's accounts", async () => {
+		const { auth, signInWithTestUser, client } = await getTestInstance({
+			socialProviders: {
+				google: { clientId: "test", clientSecret: "test", enabled: true },
+				github: { clientId: "test", clientSecret: "test", enabled: true },
+			},
+			account: {
+				accountLinking: {
+					allowDifferentEmails: true,
+				},
+			},
+		});
+		const ctx = await auth.$context;
+		const accountId = "github-only-account-id";
+
+		const { runWithUser, user } = await signInWithTestUser();
+		await ctx.internalAdapter.createAccount({
+			userId: user.id,
+			providerId: "github",
+			accountId,
+			accessToken: "github-access-token",
+		});
+
+		await runWithUser(async () => {
+			const info = await client.$fetch("/account-info", {
+				query: { accountId, providerId: "google" },
+				method: "GET",
+			});
+
+			expect(info.error?.message).toBe(
+				BASE_ERROR_CODES.ACCOUNT_NOT_FOUND.message,
+			);
+		});
+	});
+
+	it("should reject account info for a non-social (credential) account", async () => {
+		// A credential account stores its accountId as the user id. Asking for its
+		// provider info is a client error (400), not a server error (500).
+		const { runWithUser, user } = await signInWithTestUser();
+		await runWithUser(async () => {
+			const info = await client.$fetch("/account-info", {
+				query: { accountId: user.id },
+				method: "GET",
+			});
+
+			expect(info.error?.status).toBe(400);
+			expect(info.error?.message).toBe(
+				"Account is not associated with a configured social provider.",
+			);
 		});
 	});
 
@@ -547,6 +873,142 @@ describe("account", async () => {
 
 		expect(accessTokenRes.data).toBeDefined();
 		expect(accessTokenRes.data?.accessToken).toBe("test");
+	});
+
+	it("should use account cookie when accountId is omitted in getAccessToken", async () => {
+		const { auth, client, cookieSetter } = await getTestInstance({
+			socialProviders: {
+				google: {
+					clientId: "test",
+					clientSecret: "test",
+					enabled: true,
+				},
+			},
+			account: {
+				storeAccountCookie: true,
+			},
+		});
+
+		const testCtx = await auth.$context;
+		const headers = new Headers();
+		email = "account-cookie-match@test.com";
+
+		// Start OAuth sign-in flow
+		const signInRes = await client.signIn.social({
+			provider: "google",
+			callbackURL: "/callback",
+			fetchOptions: {
+				onSuccess: cookieSetter(headers),
+			},
+		});
+
+		const state =
+			signInRes.data && "url" in signInRes.data && signInRes.data.url
+				? new URL(signInRes.data.url).searchParams.get("state") || ""
+				: "";
+
+		// Complete OAuth callback
+		await client.$fetch("/callback/google", {
+			query: {
+				state,
+				code: "test",
+			},
+			headers,
+			method: "GET",
+			onError(context) {
+				expect(context.response.status).toBe(302);
+				cookieSetter(headers)({ response: context.response });
+			},
+		});
+
+		// Spy on findAccounts to verify cookie path is used (no DB fallback)
+		const findAccountsSpy = vi.spyOn(testCtx.internalAdapter, "findAccounts");
+
+		const accessTokenRes = await client.getAccessToken(
+			{
+				providerId: "google",
+			},
+			{
+				headers,
+			},
+		);
+
+		expect(accessTokenRes.data?.accessToken).toBe("test");
+		// Cookie should have matched directly, no DB lookup needed
+		expect(findAccountsSpy).not.toHaveBeenCalled();
+		findAccountsSpy.mockRestore();
+	});
+
+	it("should match account cookie by accountId in getAccessToken when accountId is provided", async () => {
+		const { auth, client, cookieSetter } = await getTestInstance({
+			socialProviders: {
+				google: {
+					clientId: "test",
+					clientSecret: "test",
+					enabled: true,
+				},
+			},
+			account: {
+				storeAccountCookie: true,
+			},
+		});
+
+		const testCtx = await auth.$context;
+		const headers = new Headers();
+		email = "account-cookie-accountid@test.com";
+
+		const signInRes = await client.signIn.social({
+			provider: "google",
+			callbackURL: "/callback",
+			fetchOptions: {
+				onSuccess: cookieSetter(headers),
+			},
+		});
+
+		const state =
+			signInRes.data && "url" in signInRes.data && signInRes.data.url
+				? new URL(signInRes.data.url).searchParams.get("state") || ""
+				: "";
+
+		await client.$fetch("/callback/google", {
+			query: {
+				state,
+				code: "test",
+			},
+			headers,
+			method: "GET",
+			onError(context) {
+				expect(context.response.status).toBe(302);
+				cookieSetter(headers)({ response: context.response });
+			},
+		});
+
+		// Get the provider accountId from the cookie/DB
+		const accounts = await client.listAccounts({
+			fetchOptions: { headers },
+		});
+		const googleAccount = accounts.data?.find((a) => a.providerId === "google");
+		assert(googleAccount, "google account should exist");
+		// Internal id and provider accountId must differ
+		assert(googleAccount.id !== googleAccount.accountId);
+
+		const findAccountsSpy = vi.spyOn(testCtx.internalAdapter, "findAccounts");
+
+		// Pass explicit accountId (provider-issued) - this should match cookie
+		const accessTokenRes = await client.getAccessToken(
+			{
+				providerId: "google",
+				accountId: googleAccount.accountId,
+			},
+			{
+				headers,
+			},
+		);
+
+		expect(accessTokenRes.data?.accessToken).toBe("test");
+		// Cookie should have matched by accountId, no DB fallback
+		expect(findAccountsSpy).not.toHaveBeenCalled();
+		findAccountsSpy.mockRestore();
 	});
 
 	it("should persist refreshed idToken in database during getAccessToken auto-refresh", async () => {
